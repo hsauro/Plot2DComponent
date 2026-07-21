@@ -25,6 +25,9 @@ registration) and a demo application.
 - [Import / export](#import--export)
 - [Precision notes](#precision-notes)
 
+## Screenshots
+
+<img src="Images/screenshot1.png" alt="Screen-shot" width="400"> &nbsp; <img src="Images/screenshot2.png" alt="Screen-shot" width="400">
 ---
 
 ## Installing
