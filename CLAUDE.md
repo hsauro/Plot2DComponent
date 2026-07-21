@@ -9,10 +9,13 @@ control is `TSkPlotPaintBox`, a `TSkPaintBox` descendant that renders charts wit
 **Skia** backend (`ISkCanvas`). It is shipped as installable design-time/run-time
 packages plus a demo app.
 
+Published at `github.com/hsauro/Plot2DComponent`. `README.md` is the user-facing
+documentation — when changing public API, update it alongside this file.
+
 ## Building & running
 
-There is no command-line build, lint, or test setup — this is a RAD Studio IDE project.
-Build with `msbuild` or the IDE.
+There is no lint or test setup — this is a RAD Studio IDE project. Build with the IDE, or
+from the command line with `msbuild` (see the rsvars section below).
 
 - **Project group:** `Package/PlotProjectGroup.groupproj` (loads both packages + demo).
 - **Run-time package:** `Package/PlotRuntimePackage.dproj` (`{$RUNONLY}`) — all the actual code.
@@ -21,6 +24,11 @@ Build with `msbuild` or the IDE.
   Install this package in the IDE to get the component on the palette.
 - **Demo app:** `Demo/TestPlotProject.dproj` (Win64). Must set `GlobalUseSkia := True`
   before `Application.Initialize` (see `Demo/TestPlotProject.dpr`).
+- **Demo data:** the demo's sample *inputs* are tracked in `Demo/Data/`; the exe runs from
+  `Demo/Win64/<Config>/`, so `ufMain.pas` resolves them through its `DataFile(AName)` helper
+  (exe-relative `..\..\Data\`), never by bare filename. Files the demo *writes* still land
+  in the working directory. Add new sample data to `Demo/Data/` — the whole `Win64/` tree
+  is gitignored.
 
 Build/dependency notes:
 - Requires the **Skia** packages (`Skia.Package.FMX`, `Skia.Package.RTL`) — Skia must be
@@ -68,7 +76,7 @@ A verified working build script (exits 0, links `Demo\Win64\Debug\TestPlotProjec
 ```bat
 @echo off
 call "C:\Program Files (x86)\Embarcadero\Studio\37.0\bin\rsvars.bat"
-cd /d "D:\Documents\Embarcadero\Studio\Projects\fmx\PlottingComponent"
+cd /d "D:\Documents\Embarcadero\Studio\Projects\fmx\RhodyComponents\PlottingComponent"
 msbuild Demo\TestPlotProject.dproj /t:Build /p:Config=Debug /p:Platform=Win64 /nologo /v:minimal
 echo EXITCODE=%ERRORLEVEL%
 ```
@@ -93,21 +101,31 @@ Everything compiled into the component lives in `Source/` and is listed in
   `Draw` → `RenderChart` → `DrawGrid`/`DrawLegend`/series draw, auto/manual axis scaling,
   legend dragging (mouse handlers), and export (`ExportToPng`, `ExportToPdf`, `ExportCSV*`).
   Public API for adding data: `AddSeries`, `LoadData` (from CSV), `ClearSeries`,
-  `ClearNamedSeries`, `ReloadDefaults`.
+  `ClearSeriesKind(SeriesKind)`, `ReloadDefaults`. `LoadData(FileName, LineVisible,
+  MarkerVisible, ClearSeries, ClearDataKinds)` returns a `TStringList` whose objects
+  are the new series — the caller frees the list, not the objects; `ClearDataKinds`
+  drops existing `skData` series first, leaving simulation curves alone.
   - **`OnPointPicked(Sender, Series, Index, DataX, DataY)`** — fires on a left-click that
     lands within `PickTolerance` pixels (default 8) of a stored data point, handing back
     that point's **exact** double value (e.g. a fold's `B = 24.384900179508524`) rather than
     the cursor's world position like `OnReportCoordinates`. `FindNearestPoint` does the
     pixel-space search over visible series, skipping NaN pen-lifts.
   - **`ZoomPanEnabled`** (default `False`) — activatable interaction: mouse-wheel zoom about
-    the cursor, left-drag pan, double-click (or `ResetZoom`) to restore autoscale. Off by
+    the cursor, left-drag pan, **Shift+left-drag rubber-band box zoom** (a box under 5px is
+    ignored as a Shift-click), double-click (or `ResetZoom`) to restore autoscale. Off by
     default so plain plots are unaffected. When on, it writes an explicit view window
     (`FViewRect`, data coords) that `RenderChart` uses **verbatim** — bypassing autoscale,
     manual `AxisLimits`, and the 5% padding, preserving deep-zoom precision. Zoom/pan math
     works in **pixel space** (unmapping through the mapper), so log axes come out right for
     free. A left press is a pan *candidate* until it crosses a 3px threshold; a press that
     stays under it is a click and fires `OnPointPicked` on mouse-up — so picking and panning
-    coexist.
+    coexist. Pan and box zoom each snapshot the mapper at press time, so a drag is exact
+    and drift-free.
+  - **Persistence** — `SavePlotToFile`/`LoadPlotFromFile` write styling *and* data points as
+    JSON. Separately, an in-memory **settings store** (`SaveSettings`/`RestoreSettings`/
+    `HasSettings`/`DeleteSettings`/`ClearAllSettings`/`SettingsKeys`) snapshots styling only,
+    no data, under a string key; per-series styling is matched back by series **Name**. The
+    control owns the snapshots (`TPlotSettings`) and frees them — callers only pass keys.
 - **`uPlotSeries.pas`** — `TPlotSeries` (one X/Y curve: `Data: TList<TPointD>` — **double
   precision**, line + marker styling, `Draw`) and `TPlotSeriesList`. A series knows how to
   draw itself given a `TPlotMapper`. Two bifurcation-oriented behaviours in `Draw`: a point
@@ -115,6 +133,10 @@ Everything compiled into the component lives in `Source/` and is listed in
   convention — one series can hold several disconnected runs), and a single-point series
   still renders its marker (the guard is `Count < 1`, not `< 2`). `ShowInLegend: Boolean`
   keeps a curve on the chart but out of the legend, independently of `Visible`.
+  `SeriesKind` (`skSimulation`/`skData`) classifies a curve — `ClearSeriesKind` deletes by
+  it. The tagged `AddXY(X, Y, ATag)` overload records a back-reference to the source row,
+  read back with `SourceTag(Index)` (-1 if untagged); it is sparse and keyed by point index,
+  so `Clear`/`Clone`/JSON need no alignment upkeep.
 - **`uPlotAnnotation.pas`** — `TPlotAnnotation` + `TPlotAnnotationList`. A text label
   anchored in **data** coordinates but offset in **screen pixels**, so it stays glued to a
   point (e.g. `LP1`/`H1`/`BP2`) through resize/rescale with a constant visual gap. Carries
@@ -137,6 +159,9 @@ Everything compiled into the component lives in `Source/` and is listed in
   a fixed palette so successive series get distinct colors. `ResetCycle` to restart.
 - **`uCSVReaderForPlotter.pas`** — CSV parser used by `LoadData`. Supports an error-bar
   extension (`value [+e,-e]` in brackets) and `NA` missing-data markers.
+- **`uPlotJsonUtils.pas`** — small `JPut*`/`J*` get-with-fallback helpers shared by every
+  unit's JSON persistence. A missing key keeps the current value, so older/newer files load
+  gracefully; follow that convention when adding persisted fields.
 - **`uMathParser.pas`** — small expression parser (for function-defined series).
 - **`ufPlotEditor.pas` / `.fmx`** — `TFrmPlotEditor`, a tabbed dialog for editing chart /
   axis / series / legend properties at run time. Depends on `TLabelledTrackBar`.
@@ -161,8 +186,10 @@ Everything compiled into the component lives in `Source/` and is listed in
 
 ### Typical usage (from the demo)
 ```pascal
-Plot.LoadData('linear.csv', True, True, False).Free;   // line + markers, don't clear
+// line + markers, don't clear existing series, don't drop skData series
+Plot.LoadData(DataFile('linear.csv'), True, True, False, False).Free;
 ps := TPlotSeries.Create('Fitted', claBlue, False);    // no markers
 ps.AddXY(x, y);
 Plot.AddSeries(ps);
+Plot.Redraw;
 ```

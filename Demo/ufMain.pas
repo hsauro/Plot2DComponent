@@ -141,7 +141,7 @@ end;
 procedure TfrmMain.btnLoadSimDataClick(Sender: TObject);
 begin
   Plot.ClearSeries;
-  Plot.LoadData(DataFile('Simdata.csv'), True, False, False, True);
+  Plot.LoadData(DataFile('Simdata.csv'), True, False, False, True).Free;
   for var i := 0 to Plot.Series.Count -1 do
       Plot.Series[i].SeriesKind := skSimulation;
 end;
