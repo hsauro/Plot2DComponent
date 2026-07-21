@@ -91,6 +91,11 @@ type
     procedure btnRestoreSettingsClick(Sender: TObject);
   private
 //    { Private declarations }
+    // Full path to one of the demo's sample data files. They live in Demo\Data\
+    // (tracked in the repository) while the exe runs from Demo\Win64\<Config>\,
+    // so resolve them relative to the executable rather than the working
+    // directory. Files the demo *writes* still go to the working directory.
+    function  DataFile(const AName: string): string;
     procedure PlotBox1ReportCoordinates(mouseX, mouseY, worldX, worldY: Single);
   public
     { Public declarations }
@@ -104,6 +109,13 @@ implementation
 {$R *.fmx}
 
 Uses uColorManager;
+
+function TfrmMain.DataFile(const AName: string): string;
+begin
+  Result := TPath.GetFullPath(
+              TPath.Combine(ExtractFilePath(ParamStr(0)),
+                            TPath.Combine('..\..\Data', AName)));
+end;
 
 procedure TfrmMain.btnClearClick(Sender: TObject);
 begin
@@ -129,7 +141,7 @@ end;
 procedure TfrmMain.btnLoadSimDataClick(Sender: TObject);
 begin
   Plot.ClearSeries;
-  Plot.LoadData('simdata.csv', True, False, False, True);
+  Plot.LoadData(DataFile('Simdata.csv'), True, False, False, True);
   for var i := 0 to Plot.Series.Count -1 do
       Plot.Series[i].SeriesKind := skSimulation;
 end;
@@ -246,7 +258,7 @@ var Slope, Intercept : Double;
     ps : TPlotSeries;
     x1, y1, x2, y2 : Double;
 begin
-  Plot.LoadData('linear.csv', True, True, False, False).Free;
+  Plot.LoadData(DataFile('linear.csv'), True, True, False, False).Free;
   CalculateLinearRegression(Plot.Series[0], Slope, Intercept);
   ps := TPlotSeries.Create('Fitted', claBlue, False);
   x1 := Plot.Series[0].Data[0].X;
@@ -347,7 +359,7 @@ begin
   //Plot.Width := 350;
   //Plot.Height := 300;
   Plot.OnReportCoordinates := PlotBox1ReportCoordinates;
-  Plot.DefaultsFile := TPath.Combine(ExtractFilePath(ParamStr(0)), 'plot_defaults.json');
+  Plot.DefaultsFile := DataFile('plot_defaults.json');
 
   // Create some standard data
 

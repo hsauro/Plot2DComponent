@@ -1,0 +1,10 @@
+{
+  "series": {
+    "lineWidth": 3.0,
+    "lineStyle": "Solid",
+    "markerSize": 6.0,
+    "markerShape": "Circle",
+    "markerStrokeWidth": 1.5,
+    "markerFillColor": "#FFFFFFFF"
+  }
+}
