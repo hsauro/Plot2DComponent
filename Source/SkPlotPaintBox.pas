@@ -1444,8 +1444,9 @@ begin
   JPutFloat(Legend, 'offsetY', FLegendOffset.Y);
   Result.AddPair('legendStyle', Legend);
 
-  // Per-series styling keyed by series Name (no data). If two series share a
-  // name the later one wins on restore, which is acceptable for styling.
+  // Per-series styling keyed by series Name (no data). Two series may share a
+  // name (a data overlay and its simulated counterpart); both entries are
+  // written, and ApplyStylingJson pairs them back up by name + SeriesKind.
   SeriesMap := TJSONObject.Create;
   for S in FSeriesList do
     SeriesMap.AddPair(S.Name, S.SaveStyleToJson);
@@ -1453,16 +1454,29 @@ begin
 end;
 
 // Apply a styling-only snapshot produced by CaptureStylingJson. Component
-// level styling is overwritten; per-series styling is matched by Name —
-// series absent from the snapshot are left as-is, snapshot entries with no
-// matching series are ignored.
+// level styling is overwritten; per-series styling is matched by Name and
+// SeriesKind — series absent from the snapshot are left as-is, snapshot
+// entries with no matching series are ignored.
+//
+// SeriesKind takes part in the match because a chart can legitimately hold two
+// series with the same name but different kinds — an overlaid data set named
+// S1 alongside the simulated S1. Matching on name alone let the data series
+// pick up the simulation entry, and since LoadStyleFromJson also writes back
+// seriesKind, the data series was silently re-labelled skSimulation and then
+// destroyed by the host's next ClearSeriesKind(skSimulation).
+//
+// Each series is consumed by at most one snapshot entry so duplicate names
+// pair up one-to-one rather than all collapsing onto the first match.
 procedure TSkPlotPaintBox.ApplyStylingJson(const Root: TJSONObject);
 var
   V: TJSONValue;
-  Chart, SeriesMap: TJSONObject;
+  Chart, SeriesMap, Entry: TJSONObject;
   Pair: TJSONPair;
   S: TPlotSeries;
-  Idx: Integer;
+  Idx, I: Integer;
+  Taken: TArray<Boolean>;
+  KindValue: TJSONValue;
+  WantKind: Integer;
 begin
   if Root = nil then Exit;
 
@@ -1503,18 +1517,42 @@ begin
       JFloat(TJSONObject(V), 'offsetY', FLegendOffset.Y));
   end;
 
-  // Per-series styling, matched by Name.
+  // Per-series styling, matched by Name + SeriesKind.
   V := Root.GetValue('seriesStyles');
   if V is TJSONObject then
   begin
     SeriesMap := TJSONObject(V);
+    SetLength(Taken, FSeriesList.Count);
+
     for Pair in SeriesMap do
-      if (Pair.JsonValue is TJSONObject) and
-         FSeriesList.Find(Pair.JsonString.Value, Idx) then
+    begin
+      if not (Pair.JsonValue is TJSONObject) then Continue;
+      Entry := TJSONObject(Pair.JsonValue);
+
+      // Snapshots written before seriesKind was recorded fall back to
+      // matching on name alone.
+      KindValue := Entry.GetValue('seriesKind');
+      WantKind  := -1;
+      if KindValue <> nil then
+        WantKind := JInt(Entry, 'seriesKind', -1);
+
+      Idx := -1;
+      for I := 0 to FSeriesList.Count - 1 do
+        if (not Taken[I]) and
+           SameText(FSeriesList[I].Name, Pair.JsonString.Value) and
+           ((WantKind < 0) or (Ord(FSeriesList[I].SeriesKind) = WantKind)) then
+        begin
+          Idx := I;
+          Break;
+        end;
+
+      if Idx >= 0 then
       begin
+        Taken[Idx] := True;
         S := FSeriesList[Idx];
-        S.LoadStyleFromJson(TJSONObject(Pair.JsonValue));
+        S.LoadStyleFromJson(Entry);
       end;
+    end;
   end;
 end;
 
