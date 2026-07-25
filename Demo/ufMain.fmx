@@ -34654,6 +34654,7 @@ object frmMain: TfrmMain
       Size.Width = 872.000000000000000000
       Size.Height = 536.000000000000000000
       Size.PlatformDefault = False
+      PickTolerance = 8.000000000000000000
       AxisLimits.MaxX = 1.000000000000000000
       AxisLimits.MaxY = 1.000000000000000000
       AxisStyle.LogX = False

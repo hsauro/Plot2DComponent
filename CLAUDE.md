@@ -112,8 +112,8 @@ Everything compiled into the component lives in `Source/` and is listed in
     pixel-space search over visible series, skipping NaN pen-lifts.
   - **`ZoomPanEnabled`** (default `False`) — activatable interaction: mouse-wheel zoom about
     the cursor, left-drag pan, **Shift+left-drag rubber-band box zoom** (a box under 5px is
-    ignored as a Shift-click), double-click (or `ResetZoom`) to restore autoscale. Off by
-    default so plain plots are unaffected. When on, it writes an explicit view window
+    ignored as a Shift-click), **Ctrl+double-click** (or `ResetZoom`) to restore autoscale.
+    Off by default so plain plots are unaffected. When on, it writes an explicit view window
     (`FViewRect`, data coords) that `RenderChart` uses **verbatim** — bypassing autoscale,
     manual `AxisLimits`, and the 5% padding, preserving deep-zoom precision. Zoom/pan math
     works in **pixel space** (unmapping through the mapper), so log axes come out right for
@@ -121,6 +121,21 @@ Everything compiled into the component lives in `Source/` and is listed in
     stays under it is a click and fires `OnPointPicked` on mouse-up — so picking and panning
     coexist. Pan and box zoom each snapshot the mapper at press time, so a drag is exact
     and drift-free.
+  - **Legend click-to-toggle** — `LegendStyle.ClickToToggle` (default `True`) makes a
+    click on a legend row flip that series' `Visible`. Because a hidden series must stay
+    clickable, `DrawLegend` lists any `ShowInLegend` series *regardless of* `Visible` when
+    this is on, drawing hidden rows inside an `ACanvas.SaveLayerAlpha` layer at
+    `DimmedOpacity` (a layer, not a paint alpha — `TPlotSeries.DrawMarker` sets its own
+    colors, so per-paint alpha would not reach the marker). `DrawLegend` caches one rect
+    per rendered row (`FLegendItemRects`/`FLegendItemSeries`, cleared at the top of every
+    call) and `FindLegendItem` hit-tests them. A legend press is a drag *candidate*:
+    `MouseMove` promotes it past a 3px threshold (`FLegendDragMoved`), and `MouseUp`
+    treats anything under that as a click — so dragging and toggling coexist. Note
+    `CalculateDataBounds` ignores `Visible`, so toggling never rescales the axes.
+  - **`DblClick`** — a plain double-click opens the run-time property editor
+    (`TFrmPlotEditor`, created lazily, shown non-modally) regardless of `ZoomPanEnabled`;
+    **Ctrl+double-click** is the zoom reset. The Ctrl state is captured on mouse-down
+    (`FCtrlPressed`) and consumed/cleared by `DblClick`.
   - **Persistence** — `SavePlotToFile`/`LoadPlotFromFile` write styling *and* data points as
     JSON. Separately, an in-memory **settings store** (`SaveSettings`/`RestoreSettings`/
     `HasSettings`/`DeleteSettings`/`ClearAllSettings`/`SettingsKeys`) snapshots styling only,
@@ -133,6 +148,23 @@ Everything compiled into the component lives in `Source/` and is listed in
   convention — one series can hold several disconnected runs), and a single-point series
   still renders its marker (the guard is `Count < 1`, not `< 2`). `ShowInLegend: Boolean`
   keeps a curve on the chart but out of the legend, independently of `Visible`.
+  **Drop lines** (`DropLinesVisible`/`DropLineColor`/`DropLineWidth`/`DropLineStyle`/
+  `DropLineBaseline`) draw a vertical stem from every point to a baseline in **data**
+  coords (default `0.0`) — the residual-plot presentation. Whole-series only, no
+  per-point control; off by default. Drawn first in `Draw` so curve and markers land on
+  top, using the same NaN/log skip rules, with a log-Y guard that drops the baseline to
+  `PixelRect.Bottom` when it is non-positive.
+  **Y error bars** — magnitudes live in `FYErrors`, a sparse `TDictionary<Integer,
+  TYErrorValue>` keyed by point index (same pattern as `FSourceTags`, chosen so `Data`
+  stays a plain `TList<TPointD>` and the mapper's double-precision path is untouched);
+  set with `SetYError(Index, E)` / `SetYError(Index, Minus, Plus)`, read with
+  `TryGetYError`. `ErrorBarsVisible` is the whole-series switch, with `ErrorBarColor`/
+  `ErrorBarWidth`/`ErrorBarCapSize` (total cap width, px) and `ErrorBarDirection`
+  (`ebdBoth`/`ebdUp`/`ebdDown`). Signs are ignored — `Abs` at draw time. Errors are
+  **data**: they ride in `SaveToJson`/`LoadFromJson` as a sparse `yErrors` array of
+  `[index, minus, plus]`, *not* in `SaveStyleToJson`. **`CalculateDataBounds` extends the
+  Y range over the bars** (only when visible, only in the drawn direction), which is why
+  its inner loop is indexed rather than for-in. X errors are not supported yet.
   `SeriesKind` (`skSimulation`/`skData`) classifies a curve — `ClearSeriesKind` deletes by
   it. The tagged `AddXY(X, Y, ATag)` overload records a back-reference to the source row,
   read back with `SourceTag(Index)` (-1 if untagged); it is sparse and keyed by point index,
@@ -158,7 +190,15 @@ Everything compiled into the component lives in `Source/` and is listed in
 - **`uColorManager.pas`** — `TColorManager` static class; `TColorManager.NextColor` cycles
   a fixed palette so successive series get distinct colors. `ResetCycle` to restart.
 - **`uCSVReaderForPlotter.pas`** — CSV parser used by `LoadData`. Supports an error-bar
-  extension (`value [+e,-e]` in brackets) and `NA` missing-data markers.
+  extension (`value [+e,-e]` in brackets) and `NA` missing-data markers. **Rows end on
+  CR**, so an LF-only file dies with "Too many datum points on line: 1" — sample data
+  must be CRLF. `LoadData` feeds the error terms into `TPlotSeries.SetYError` (Y only;
+  an error on column 0 would be an X error and is ignored) and switches
+  `ErrorBarsVisible` on for any column that had one. Verified against the parser:
+  `readErrorData` puts the **first** bracketed value in `.lower` and the **second** in
+  `.upper` — inverted vs. the `[+e,-e]` convention in its own header — so `LoadData`
+  resolves arms **by sign** when the two disagree and falls back to positional order
+  (first below, second above) when they don't.
 - **`uPlotJsonUtils.pas`** — small `JPut*`/`J*` get-with-fallback helpers shared by every
   unit's JSON persistence. A missing key keeps the current value, so older/newer files load
   gracefully; follow that convention when adding persisted fields.

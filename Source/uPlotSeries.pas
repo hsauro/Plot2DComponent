@@ -18,6 +18,18 @@ type
   TMarkerShape = (symPoint, symSquare, symCircle, symCross, symTimes, symDiamond, symTriangle);
   TLineStyle = (ltSolid, ltDashDash, ltDotDot);
 
+  // Which half of a Y error bar to draw. ebdUp / ebdDown draw one arm only —
+  // used where the error is meaningful in a single direction (a detection
+  // limit, a one-sided bound).
+  TErrorBarDirection = (ebdBoth, ebdUp, ebdDown);
+
+  // A Y error attached to one data point. Stored as two magnitudes either side
+  // of the point; a symmetric error simply has Minus = Plus. Signs are ignored
+  // (Abs is applied when drawing) so "+0.1,-0.1" and "0.1,0.1" mean the same.
+  TYErrorValue = record
+    Minus, Plus : Double;
+  end;
+
   TDataList = TList<TPointD>;
 
  TPlotSeries = class
@@ -40,10 +52,30 @@ type
       FMarkerStrokeWidth: Single;
       FMarkerShape : TMarkerShape;
       FMarkerVisible : Boolean;
+
+      // Drop lines (stems): a vertical line from every point down to a
+      // baseline. All-or-nothing for the series, never per point.
+      FDropLinesVisible : Boolean;
+      FDropLineColor : TAlphaColor;
+      FDropLineWidth : Single;
+      FDropLineStyle : TLineStyle;
+      FDropLineBaseline : Double;
       // Optional back-reference from a plotted point to the data it came from. Sparse: only
       // points added via the tagged AddXY overload have an entry, keyed by their Data index.
       // Keyed (not a parallel list) so Clear/Clone/JSON need no alignment upkeep.
       FSourceTags : TDictionary<Integer, Integer>;
+
+      // Error bars (Y only for now). Sparse and keyed by point index, exactly
+      // like FSourceTags: a series usually has errors on all points or none,
+      // but keying them keeps Data a plain TList<TPointD> — widening TPointD
+      // would drag the mapper and the whole double-precision path along with
+      // it — and means Clear/Clone/JSON need no alignment upkeep.
+      FYErrors : TDictionary<Integer, TYErrorValue>;
+      FErrorBarsVisible : Boolean;
+      FErrorBarColor : TAlphaColor;
+      FErrorBarWidth : Single;
+      FErrorBarCapSize : Single;
+      FErrorBarDirection : TErrorBarDirection;
   public
       SeriesKind : TSeriesKind; // put what ever you want here to identify a particular type of series
       SeriesId : String; // More detailed identifier, usually a file name for data
@@ -62,6 +94,22 @@ type
       // The tag stored for the point at AIndex, or -1 if that point wasn't tagged.
       function SourceTag (AIndex : Integer) : Integer;
       function Clone : TPlotSeries;
+
+      // --- Y error bars -------------------------------------------------
+      // Attach an error to the point at AIndex. The one-magnitude overload is
+      // symmetric; the two-magnitude overload takes the below-point and
+      // above-point magnitudes separately. Setting an error on an index that
+      // has one replaces it. Nothing is drawn until ErrorBarsVisible is set.
+      procedure SetYError (AIndex : Integer; AError : Double); overload;
+      procedure SetYError (AIndex : Integer; AMinus, APlus : Double); overload;
+      // True (and fills the out params) if the point at AIndex has an error.
+      function  TryGetYError (AIndex : Integer; out AMinus, APlus : Double) : Boolean;
+      function  HasYError (AIndex : Integer) : Boolean;
+      // Drop the error on one point, or on every point.
+      procedure ClearYError (AIndex : Integer);
+      procedure ClearYErrors;
+      // How many points carry an error.
+      function  YErrorCount : Integer;
 
       // JSON persistence. SaveToJson returns a new object the caller owns;
       // LoadFromJson overwrites this series' styling and replaces its data
@@ -93,6 +141,32 @@ type
       property MarkerShape : TMarkerShape read FMarkerShape write FMarkerShape;
       property MarkerVisible : Boolean read FMarkerVisible write FMarkerVisible;
 
+      // Drop lines / stems. Switching DropLinesVisible on draws a vertical
+      // line from every point in the series to DropLineBaseline — the usual
+      // presentation for a residual plot. It is a whole-series setting; there
+      // is deliberately no per-point control.
+      //
+      // DropLineBaseline is in DATA coordinates and defaults to 0, which for
+      // residuals is the zero line. Set it elsewhere to stem from a different
+      // level. On a log Y axis a baseline of zero has no representation, so
+      // the stems fall to the bottom of the plot area instead.
+      property DropLinesVisible : Boolean read FDropLinesVisible write FDropLinesVisible;
+      property DropLineColor : TAlphaColor read FDropLineColor write FDropLineColor;
+      property DropLineWidth : Single read FDropLineWidth write FDropLineWidth;
+      property DropLineStyle : TLineStyle read FDropLineStyle write FDropLineStyle;
+      property DropLineBaseline : Double read FDropLineBaseline write FDropLineBaseline;
+
+      // Y error bars. Like drop lines this is a whole-series switch, but the
+      // error magnitudes themselves are per point (SetYError) — points without
+      // one simply get no bar. Bars are included in the chart's autoscale when
+      // visible, so an arm never gets clipped by the plot edge.
+      property ErrorBarsVisible : Boolean read FErrorBarsVisible write FErrorBarsVisible;
+      property ErrorBarColor : TAlphaColor read FErrorBarColor write FErrorBarColor;
+      property ErrorBarWidth : Single read FErrorBarWidth write FErrorBarWidth;
+      // Total width of the end cap in pixels; 0 draws a bare bar with no cap.
+      property ErrorBarCapSize : Single read FErrorBarCapSize write FErrorBarCapSize;
+      property ErrorBarDirection : TErrorBarDirection read FErrorBarDirection write FErrorBarDirection;
+
       property Visible: Boolean read FVisible write FVisible;
 
       // Controls whether this series appears in the legend, independently of
@@ -118,6 +192,12 @@ type
       'Solid',
       'Dash-Dash',
       'Dot-Dot'
+  );
+
+    ErrorBarDirectionNames: array[TErrorBarDirection] of string = (
+      'Both',
+      'Up',
+      'Down'
   );
 
   function MarkerStrToMarkerShape (MarkerStr : String) : TMarkerShape;
@@ -171,13 +251,29 @@ begin
   MarkerStrokeWidth := PlotDefaults.MarkerStrokeWidth;
   MarkerShape       := PlotDefaults.MarkerShape;
 
+  // Drop lines — off by default, so nothing changes for existing plots.
+  FDropLinesVisible := False;
+  FDropLineColor    := AStrokeColor;   // stems track the series color
+  FDropLineWidth    := PlotDefaults.LineWidth;
+  FDropLineStyle    := ltSolid;
+  FDropLineBaseline := 0.0;
+
+  // Error bars — off by default; magnitudes are attached per point.
+  FErrorBarsVisible  := False;
+  FErrorBarColor     := AStrokeColor;   // bars track the series color
+  FErrorBarWidth     := 1.0;
+  FErrorBarCapSize   := 6.0;            // total cap width in pixels
+  FErrorBarDirection := ebdBoth;
+
   Data := TDataList.Create;
   FSourceTags := TDictionary<Integer, Integer>.Create;
+  FYErrors := TDictionary<Integer, TYErrorValue>.Create;
   Tag := 0;
 end;
 
 destructor TPlotSeries.Destroy;
 begin
+  FYErrors.Free;
   FSourceTags.Free;
   Data.Free;
   inherited Destroy;
@@ -300,6 +396,21 @@ var
   I: Integer;
   P1, P2: TPointD;
   LIntervals : TArray<single>;
+  BaseY : Single;   // pixel Y of the drop-line baseline
+  Err : TYErrorValue;
+  ArmY, HalfCap : Single;
+
+  // Map a Y data value to pixels, coping with a log axis: a value at or below
+  // zero has no representation there, so the end is pinned to the foot of the
+  // plot area rather than fed to a logarithm.
+  function MapYSafe (AValue : Double) : Single;
+  begin
+    if AMapper.LogY and (AValue <= 0) then
+      Result := AMapper.PixelRect.Bottom
+    else
+      Result := AMapper.MapY(AValue);
+  end;
+
 begin
   if not FVisible then Exit;
 
@@ -314,7 +425,85 @@ begin
   LPaint := TSkPaint.Create;
   LPaint.AntiAlias := True;
 
-  // 1. DRAW THE LINE as a SINGLE path (moveTo/lineTo), stroked once. Drawing segment-by-segment
+  // 1. DRAW THE DROP LINES (stems) first, so the curve and its markers land on
+  // top of them. One vertical segment per point, down to the baseline — drawn
+  // as separate lines rather than one path so a dashed style restarts on every
+  // stem instead of running continuously through them.
+  if FDropLinesVisible then
+  begin
+    LPaint.Style       := TSkPaintStyle.Stroke;
+    LPaint.Color       := FDropLineColor;
+    LPaint.StrokeWidth := FDropLineWidth;
+    LPaint.StrokeCap   := TSkStrokeCap.Butt;
+
+    case FDropLineStyle of
+      TLineStyle.ltDashDash: LPaint.PathEffect := TSkPathEffect.MakeDash([3 * FDropLineWidth, 2.5 * FDropLineWidth], 0);
+      TLineStyle.ltDotDot:   LPaint.PathEffect := TSkPathEffect.MakeDash([FDropLineWidth, 2.5 * FDropLineWidth], 0);
+    else
+      LPaint.PathEffect := nil;
+    end;
+
+    // Where the stems land, in pixels. A non-positive baseline has no place on
+    // a log Y axis, so MapYSafe drops it to the foot of the plot area there.
+    BaseY := MapYSafe(FDropLineBaseline);
+
+    for I := 0 to Data.Count - 1 do
+    begin
+      // Same pen-lift and log-exclusion rules as the line and marker loops:
+      // a point that isn't plotted gets no stem.
+      if IsNan(Data[I].X) or IsNan(Data[I].Y) then Continue;
+      if AMapper.LogX and (Data[I].X <= 0) then Continue;
+      if AMapper.LogY and (Data[I].Y <= 0) then Continue;
+
+      P1 := AMapper.MapPoint(Data[I]);
+      ACanvas.DrawLine(P1.X, P1.Y, P1.X, BaseY, LPaint);
+    end;
+    LPaint.PathEffect := nil;
+  end;
+
+  // 2. DRAW THE Y ERROR BARS, still beneath the curve and markers so the point
+  // itself stays legible on top of its bar. Only points carrying an error get
+  // one; FYErrors is sparse, so a series with no errors costs nothing here.
+  if FErrorBarsVisible and (FYErrors.Count > 0) then
+  begin
+    LPaint.Style       := TSkPaintStyle.Stroke;
+    LPaint.Color       := FErrorBarColor;
+    LPaint.StrokeWidth := FErrorBarWidth;
+    LPaint.StrokeCap   := TSkStrokeCap.Butt;
+    LPaint.PathEffect  := nil;
+    HalfCap := FErrorBarCapSize / 2;
+
+    for I := 0 to Data.Count - 1 do
+    begin
+      if not FYErrors.TryGetValue(I, Err) then Continue;
+
+      // Same skip rules as everywhere else: a point that isn't plotted gets
+      // no bar.
+      if IsNan(Data[I].X) or IsNan(Data[I].Y) then Continue;
+      if AMapper.LogX and (Data[I].X <= 0) then Continue;
+      if AMapper.LogY and (Data[I].Y <= 0) then Continue;
+
+      P1 := AMapper.MapPoint(Data[I]);
+
+      if FErrorBarDirection in [ebdBoth, ebdUp] then
+      begin
+        ArmY := MapYSafe(Data[I].Y + Abs(Err.Plus));
+        ACanvas.DrawLine(P1.X, P1.Y, P1.X, ArmY, LPaint);
+        if HalfCap > 0 then
+          ACanvas.DrawLine(P1.X - HalfCap, ArmY, P1.X + HalfCap, ArmY, LPaint);
+      end;
+
+      if FErrorBarDirection in [ebdBoth, ebdDown] then
+      begin
+        ArmY := MapYSafe(Data[I].Y - Abs(Err.Minus));
+        ACanvas.DrawLine(P1.X, P1.Y, P1.X, ArmY, LPaint);
+        if HalfCap > 0 then
+          ACanvas.DrawLine(P1.X - HalfCap, ArmY, P1.X + HalfCap, ArmY, LPaint);
+      end;
+    end;
+  end;
+
+  // 3. DRAW THE LINE as a SINGLE path (moveTo/lineTo), stroked once. Drawing segment-by-segment
   // (the old way) reset the dash pattern every segment -- so dense curves rendered near-solid --
   // and doubled a round cap at every vertex, fuzzing the line. A path fixes both: real joins and
   // a dash pattern that runs along the whole line. NaN or log-excluded points lift the pen so a
@@ -358,7 +547,7 @@ begin
     LPaint.PathEffect := nil;
   end;
 
-  // 2. DRAW THE MARKERS
+  // 4. DRAW THE MARKERS
   if MarkerVisible then
     begin
     for I := 0 to Data.Count - 1 do
@@ -397,6 +586,66 @@ begin
 end;
 
 
+procedure TPlotSeries.SetYError (AIndex : Integer; AError : Double);
+begin
+  SetYError (AIndex, AError, AError);
+end;
+
+
+procedure TPlotSeries.SetYError (AIndex : Integer; AMinus, APlus : Double);
+var
+  E : TYErrorValue;
+begin
+  // Magnitudes, not offsets: the drawing code applies Abs, so a caller that
+  // passes the CSV's signed "-0.2" gets the same bar as one passing "0.2".
+  E.Minus := AMinus;
+  E.Plus  := APlus;
+  FYErrors.AddOrSetValue (AIndex, E);
+end;
+
+
+function TPlotSeries.TryGetYError (AIndex : Integer; out AMinus, APlus : Double) : Boolean;
+var
+  E : TYErrorValue;
+begin
+  Result := FYErrors.TryGetValue (AIndex, E);
+  if Result then
+    begin
+    AMinus := E.Minus;
+    APlus  := E.Plus;
+    end
+  else
+    begin
+    AMinus := 0;
+    APlus  := 0;
+    end;
+end;
+
+
+function TPlotSeries.HasYError (AIndex : Integer) : Boolean;
+begin
+  Result := FYErrors.ContainsKey (AIndex);
+end;
+
+
+procedure TPlotSeries.ClearYError (AIndex : Integer);
+begin
+  FYErrors.Remove (AIndex);
+end;
+
+
+procedure TPlotSeries.ClearYErrors;
+begin
+  FYErrors.Clear;
+end;
+
+
+function TPlotSeries.YErrorCount : Integer;
+begin
+  Result := FYErrors.Count;
+end;
+
+
 function TPlotSeries.Clone : TPlotSeries;
 var
   I : Integer;
@@ -426,6 +675,20 @@ begin
   Result.MarkerShape       := MarkerShape;
   Result.MarkerVisible     := MarkerVisible;
 
+  // Drop lines
+  Result.DropLinesVisible := DropLinesVisible;
+  Result.DropLineColor    := DropLineColor;
+  Result.DropLineWidth    := DropLineWidth;
+  Result.DropLineStyle    := DropLineStyle;
+  Result.DropLineBaseline := DropLineBaseline;
+
+  // Error bars — styling, then the per-point magnitudes
+  Result.ErrorBarsVisible  := ErrorBarsVisible;
+  Result.ErrorBarColor     := ErrorBarColor;
+  Result.ErrorBarWidth     := ErrorBarWidth;
+  Result.ErrorBarCapSize   := ErrorBarCapSize;
+  Result.ErrorBarDirection := ErrorBarDirection;
+
   // Deep copy the data points. The constructor already created an empty
   // TDataList, so we just need to fill it. Capacity hint avoids repeated
   // reallocation for large series.
@@ -435,6 +698,9 @@ begin
 
   for var Pair in FSourceTags do
     Result.FSourceTags.AddOrSetValue(Pair.Key, Pair.Value);
+
+  for var EPair in FYErrors do
+    Result.FYErrors.AddOrSetValue(EPair.Key, EPair.Value);
 end;
 
 
@@ -459,6 +725,18 @@ begin
   JPutFloat(Result, 'markerStrokeWidth', MarkerStrokeWidth);
   JPutInt  (Result, 'markerShape',       Ord (MarkerShape));
   JPutBool (Result, 'markerVisible',     MarkerVisible);
+
+  JPutBool (Result, 'dropLinesVisible',  DropLinesVisible);
+  JPutColor(Result, 'dropLineColor',     DropLineColor);
+  JPutFloat(Result, 'dropLineWidth',     DropLineWidth);
+  JPutInt  (Result, 'dropLineStyle',     Ord (DropLineStyle));
+  JPutFloat(Result, 'dropLineBaseline',  DropLineBaseline);
+
+  JPutBool (Result, 'errorBarsVisible',  ErrorBarsVisible);
+  JPutColor(Result, 'errorBarColor',     ErrorBarColor);
+  JPutFloat(Result, 'errorBarWidth',     ErrorBarWidth);
+  JPutFloat(Result, 'errorBarCapSize',   ErrorBarCapSize);
+  JPutInt  (Result, 'errorBarDirection', Ord (ErrorBarDirection));
 end;
 
 
@@ -483,6 +761,18 @@ begin
   MarkerStrokeWidth := JFloat (Obj, 'markerStrokeWidth', MarkerStrokeWidth);
   MarkerShape       := TMarkerShape (JInt (Obj, 'markerShape', Ord (MarkerShape)));
   MarkerVisible     := JBool  (Obj, 'markerVisible',     MarkerVisible);
+
+  DropLinesVisible := JBool  (Obj, 'dropLinesVisible', DropLinesVisible);
+  DropLineColor    := JColor (Obj, 'dropLineColor',    DropLineColor);
+  DropLineWidth    := JFloat (Obj, 'dropLineWidth',    DropLineWidth);
+  DropLineStyle    := TLineStyle (JInt (Obj, 'dropLineStyle', Ord (DropLineStyle)));
+  DropLineBaseline := JFloat (Obj, 'dropLineBaseline', DropLineBaseline);
+
+  ErrorBarsVisible  := JBool  (Obj, 'errorBarsVisible', ErrorBarsVisible);
+  ErrorBarColor     := JColor (Obj, 'errorBarColor',    ErrorBarColor);
+  ErrorBarWidth     := JFloat (Obj, 'errorBarWidth',    ErrorBarWidth);
+  ErrorBarCapSize   := JFloat (Obj, 'errorBarCapSize',  ErrorBarCapSize);
+  ErrorBarDirection := TErrorBarDirection (JInt (Obj, 'errorBarDirection', Ord (ErrorBarDirection)));
 end;
 
 
@@ -503,6 +793,25 @@ begin
     Arr.AddElement (Pt);
     end;
   Result.AddPair ('data', Arr);
+
+  // Per-point Y errors, as [index, minus, plus] triples. Written as an
+  // explicit index rather than a parallel array because FYErrors is sparse:
+  // only the points that carry an error appear, and the key is what ties an
+  // error back to its point.
+  if FYErrors.Count > 0 then
+    begin
+    Arr := TJSONArray.Create;
+    for I := 0 to Data.Count - 1 do
+      if FYErrors.ContainsKey (I) then
+        begin
+        Pt := TJSONArray.Create;
+        Pt.Add (I);
+        Pt.Add (Double (FYErrors[I].Minus));
+        Pt.Add (Double (FYErrors[I].Plus));
+        Arr.AddElement (Pt);
+        end;
+    Result.AddPair ('yErrors', Arr);
+    end;
 end;
 
 
@@ -526,6 +835,23 @@ begin
         if (Pt.Items[0] is TJSONNumber) and (Pt.Items[1] is TJSONNumber) then
           AddXY (TJSONNumber (Pt.Items[0]).AsDouble,
                  TJSONNumber (Pt.Items[1]).AsDouble);
+        end;
+
+  // ...and the per-point Y errors that go with them. A file written before
+  // error bars existed simply has no 'yErrors' key, leaving the series with
+  // none — the same graceful-degradation rule the styling keys follow.
+  ClearYErrors;
+  V := Obj.GetValue ('yErrors');
+  if V is TJSONArray then
+    for PtV in TJSONArray (V) do
+      if (PtV is TJSONArray) and (TJSONArray (PtV).Count >= 3) then
+        begin
+        Pt := TJSONArray (PtV);
+        if (Pt.Items[0] is TJSONNumber) and (Pt.Items[1] is TJSONNumber)
+           and (Pt.Items[2] is TJSONNumber) then
+          SetYError (TJSONNumber (Pt.Items[0]).AsInt,
+                     TJSONNumber (Pt.Items[1]).AsDouble,
+                     TJSONNumber (Pt.Items[2]).AsDouble);
         end;
 end;
 

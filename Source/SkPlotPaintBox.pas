@@ -238,6 +238,8 @@ type
     FBackgroundColor:   TAlphaColor;
     FBackgroundOpacity: Single;
     FLocation:          TLegendLocation;
+    FClickToToggle:     Boolean;
+    FDimmedOpacity:     Single;
   public
     constructor Create;
     function  SaveToJson: TJSONObject;
@@ -250,6 +252,12 @@ type
     property BackgroundColor:   TAlphaColor     read FBackgroundColor   write FBackgroundColor;
     property BackgroundOpacity: Single          read FBackgroundOpacity write FBackgroundOpacity;
     property Location:          TLegendLocation read FLocation          write FLocation;
+    // Clicking a legend entry toggles that series' Visible flag. Entries whose
+    // series is hidden stay listed (drawn at DimmedOpacity) — otherwise the
+    // entry would vanish on the first click and could never be clicked back on.
+    property ClickToToggle:     Boolean         read FClickToToggle     write FClickToToggle;
+    // Alpha (0..1) used to draw the swatch and label of a hidden series.
+    property DimmedOpacity:     Single          read FDimmedOpacity     write FDimmedOpacity;
   end;
 
   // -----------------------------------------------------------------------
@@ -307,6 +315,8 @@ type
     FLastMapper:  TPlotMapper;
     FHasMapper:   Boolean;
 
+    FCtrlPressed: Boolean;
+
     // Interactive zoom / pan. Off by default — a plain data plot doesn't need
     // it, but a bifurcation diagram benefits from scrolling into a fold.
     // When ZoomPanEnabled is True, the wheel zooms around the cursor, a plain
@@ -339,6 +349,12 @@ type
     FDraggingLegend:    Boolean;
     FLegendDragStart:   TPointF;   // mouse position when drag began
     FLegendOffsetStart: TPointF;   // FLegendOffset value when drag began
+    FLegendDragMoved:   Boolean;   // press crossed the drag threshold (so: drag, not click)
+
+    // Legend click-to-toggle support. Filled by DrawLegend, one entry per
+    // rendered row, so a press can be mapped back to the series it landed on.
+    FLegendItemRects:   TArray<TRectF>;
+    FLegendItemSeries:  TArray<TPlotSeries>;
 
     // Series defaults
     FDefaultsFile: String;
@@ -378,6 +394,9 @@ type
     // False otherwise. Skips invisible series and NaN pen-lift separators.
     function  FindNearestPoint(APixelX, APixelY: Single; out ASeries: TPlotSeries;
                                out AIndex: Integer; out ADataX, ADataY: Double): Boolean;
+    // Map a pixel position to the legend row drawn there, if any. Only valid
+    // after a paint has run (DrawLegend fills the row cache).
+    function  FindLegendItem(APixelX, APixelY: Single; out ASeries: TPlotSeries): Boolean;
     procedure SetZoomPanEnabled(Value: Boolean);
     // Zoom the current view by AFactor (<1 zooms in) about pixel (ACx, ACy),
     // seeding the view window from the last-drawn mapper if none is active.
@@ -508,7 +527,7 @@ type
 
 implementation
 
-uses FMX.Dialogs, Math, System.IOUtils, uPlotJsonUtils;
+uses FMX.Dialogs, Math, System.IOUtils, uPlotJsonUtils, ufPlotEditor;
 
 // -----------------------------------------------------------------------
 //  Utility
@@ -993,6 +1012,8 @@ begin
   FBackgroundColor   := TAlphaColors.White;
   FBackgroundOpacity := 0.86;
   FLocation          := llTopRight;
+  FClickToToggle     := True;
+  FDimmedOpacity     := 0.35;
 end;
 
 function TLegendStyle.SaveToJson: TJSONObject;
@@ -1005,6 +1026,8 @@ begin
   JPutColor(Result, 'backgroundColor',   FBackgroundColor);
   JPutFloat(Result, 'backgroundOpacity', FBackgroundOpacity);
   JPutInt  (Result, 'location',          Ord(FLocation));
+  JPutBool (Result, 'clickToToggle',     FClickToToggle);
+  JPutFloat(Result, 'dimmedOpacity',     FDimmedOpacity);
 end;
 
 procedure TLegendStyle.LoadFromJson(const Obj: TJSONObject);
@@ -1017,6 +1040,8 @@ begin
   FBackgroundColor   := JColor(Obj, 'backgroundColor',   FBackgroundColor);
   FBackgroundOpacity := JFloat(Obj, 'backgroundOpacity', FBackgroundOpacity);
   FLocation          := TLegendLocation(JInt(Obj, 'location', Ord(FLocation)));
+  FClickToToggle     := JBool (Obj, 'clickToToggle', FClickToToggle);
+  FDimmedOpacity     := JFloat(Obj, 'dimmedOpacity', FDimmedOpacity);
 end;
 
 // -----------------------------------------------------------------------
@@ -1028,6 +1053,7 @@ begin
   inherited Create(AOwner);
 
   HitTest := True;
+  FCtrlPressed := False;
 
   FSubAxisProperty := TAxisLimits.Create;
   FSubAxisProperty.OnChange := SubMaxXChanged;
@@ -1071,6 +1097,9 @@ begin
   FDraggingLegend    := False;
   FLegendDragStart   := TPointF.Zero;
   FLegendOffsetStart := TPointF.Zero;
+  FLegendDragMoved   := False;
+  FLegendItemRects   := nil;
+  FLegendItemSeries  := nil;
 
   // Defaults file — empty means use built-in values only
   FDefaultsFile := '';
@@ -1444,12 +1473,15 @@ begin
   JPutFloat(Legend, 'offsetY', FLegendOffset.Y);
   Result.AddPair('legendStyle', Legend);
 
-  // Per-series styling keyed by series Name (no data). Two series may share a
-  // name (a data overlay and its simulated counterpart); both entries are
-  // written, and ApplyStylingJson pairs them back up by name + SeriesKind.
+  // Per-series styling keyed by series Name (no data). Only simulation series
+  // are captured: loaded data overlays (skData) are host-managed and live
+  // independently of these per-analysis snapshots, so their styling must not be
+  // reformatted when a snapshot is restored. Two simulation series may share a
+  // name only transiently; ApplyStylingJson pairs entries by name + SeriesKind.
   SeriesMap := TJSONObject.Create;
   for S in FSeriesList do
-    SeriesMap.AddPair(S.Name, S.SaveStyleToJson);
+    if S.SeriesKind <> skData then
+      SeriesMap.AddPair(S.Name, S.SaveStyleToJson);
   Result.AddPair('seriesStyles', SeriesMap);
 end;
 
@@ -1736,6 +1768,9 @@ var
   CSV:  TCSV;
   i, j: Integer;
   ps:   TPlotSeries;
+  PtIndex: Integer;
+  HasErrors: Boolean;      // did this column carry any error terms?
+  ErrA, ErrB: Double;
 begin
   CSV := TCSV.Create(nil);
   try
@@ -1756,6 +1791,7 @@ begin
       // as an existing simulation data series, then set the color to
       // the simulation data series.
 
+      HasErrors := False;
       ps := TPlotSeries.Create(CSV.header[i], TColorManager.NextColor);
       ps.XLabel := CSV.header[0];
       ps.YLabel := CSV.header[i];
@@ -1774,7 +1810,43 @@ begin
       ps.LineVisible := LineVisible;
       ps.MarkerVisible := MarkerVisible;
       for j := 0 to CSV.Rows - 1 do
-        ps.AddXY(CSV.data[j, 0].number, CSV.data[j, i].number);
+        begin
+        PtIndex := ps.AddXY(CSV.data[j, 0].number, CSV.data[j, i].number);
+
+        // Carry over the CSV's error-bar extension (see the uCSVReaderForPlotter
+        // header for the bracket syntax). Y errors only: an error on column 0
+        // would be an X error, which the series does not model yet.
+        case CSV.errorType[j, i] of
+          etSymmetric:
+            begin
+            ps.SetYError(PtIndex, Abs(CSV.symmetricError[j, i].value));
+            HasErrors := True;
+            end;
+
+          etASymmetric:
+            begin
+            // readErrorData stores the FIRST bracketed value in .lower and the
+            // SECOND in .upper, which is the opposite way round from the
+            // header's own "[+0.1,-0.1]" example. Rather than trust either
+            // name, read the arms off the signs when they disagree — that
+            // handles "[+0.1,-0.1]" and "[-0.1,+0.1]" alike. Unsigned pairs
+            // carry no such hint, so they fall back to positional order:
+            // first value below the point, second above.
+            ErrA := CSV.asymmetricError[j, i].lower;   // first in the brackets
+            ErrB := CSV.asymmetricError[j, i].upper;   // second in the brackets
+            if (ErrA >= 0) and (ErrB < 0) then
+              ps.SetYError(PtIndex, Abs(ErrB), Abs(ErrA))
+            else
+              ps.SetYError(PtIndex, Abs(ErrA), Abs(ErrB));
+            HasErrors := True;
+            end;
+        end;
+        end;
+
+      // A file that bothered to record errors expects to see them, so switch
+      // the bars on for the columns that had any. Callers who disagree can
+      // clear ErrorBarsVisible on the returned series.
+      ps.ErrorBarsVisible := HasErrors;
       FSeriesList.Add(ps);
     end;
     Redraw;
@@ -2054,7 +2126,24 @@ var
   BgColor: TAlphaColor;
   NumberOfSeries, SeriesCount : Integer;
   LIntervals: TArray<Single>;
+  ItemRect: TRectF;
+  IsDimmed: Boolean;
+
+  // A series occupies a legend row if it asks to be listed. When click-to-
+  // toggle is on, a hidden series keeps its row (drawn dimmed) — losing the
+  // row on the first click would leave no way to switch the series back on.
+  function IsListed(const S: TPlotSeries): Boolean;
+  begin
+    Result := S.ShowInLegend and (S.Visible or FLegendStyle.ClickToToggle);
+  end;
+
 begin
+  // Drop the previous row cache up front: a legend that is not drawn this pass
+  // must not keep answering hit-tests with last paint's rectangles.
+  FLegendItemRects  := nil;
+  FLegendItemSeries := nil;
+  FLegendRect       := TRectF.Empty;
+
   if not FLegendStyle.Visible then Exit;
   if FSeriesList.Count = 0 then Exit;
 
@@ -2068,15 +2157,17 @@ begin
   // Measure the widest label to size the box
   MaxWidth := 0;
   for Series in FSeriesList do
-    if Series.Visible and Series.ShowInLegend then
+    if IsListed(Series) then
        MaxWidth := Max(MaxWidth, LFont.MeasureText(Series.Name));
 
   LegendWidth  := MaxWidth + 70;
-  // Count how many series are visible, determines legend height
+  // Count the listed series, which determines legend height
   NumberOfSeries := 0;
   for Series in FSeriesList do
-      if Series.Visible and Series.ShowInLegend then
+      if IsListed(Series) then
          Inc (NumberOfSeries);
+
+  if NumberOfSeries = 0 then Exit;
 
   LegendHeight := NumberOfSeries * 22 + 10;
   LegendRect   := TRectF.Create(0, 0, LegendWidth, LegendHeight);
@@ -2118,14 +2209,31 @@ begin
   end;
 
   // Series entries
+  SetLength(FLegendItemRects,  NumberOfSeries);
+  SetLength(FLegendItemSeries, NumberOfSeries);
   SeriesCount := 0;
   for I := 0 to FSeriesList.Count - 1 do
   begin
     Series := FSeriesList[I];
-    if Series.Visible and Series.ShowInLegend then
+    if IsListed(Series) then
        begin
        ItemY  := LegendRect.Top + 20 + (SeriesCount * 22);
+
+       // Record the clickable row (full legend width, the 22 px slot this
+       // entry was laid out in) before drawing into it.
+       ItemRect := TRectF.Create(LegendRect.Left  + 5, ItemY - 17,
+                                 LegendRect.Right - 5, ItemY + 5);
+       FLegendItemRects [SeriesCount] := ItemRect;
+       FLegendItemSeries[SeriesCount] := Series;
        Inc (SeriesCount);
+
+       // A hidden series is still listed, drawn through a translucent layer so
+       // swatch, marker and label dim together — the marker draw sets its own
+       // colours, so per-paint alpha would not reach it.
+       IsDimmed := not Series.Visible;
+       if IsDimmed then
+          ACanvas.SaveLayerAlpha(ItemRect,
+            Round(EnsureRange(FLegendStyle.DimmedOpacity, 0.0, 1.0) * 255));
 
     if Series.LineVisible then
        begin
@@ -2159,6 +2267,9 @@ begin
 
     ACanvas.DrawSimpleText(Series.Name, LegendRect.Left + 55, ItemY,
                            LFont, LTextPaint);
+
+       if IsDimmed then
+          ACanvas.Restore;
        end;
   end;
 end;
@@ -2567,6 +2678,8 @@ var
   Point:  TPointD;
   MinX, MaxX, MinY, MaxY: Double;
   FirstPoint: Boolean;
+  PIdx: Integer;
+  EMinus, EPlus, YArm: Double;
 begin
   MinX := 0; MaxX := 0; MinY := 0; MaxY := 0;
   // Default fallback range (also used when log mode hides every point)
@@ -2575,8 +2688,11 @@ begin
 
   FirstPoint := True;
   for Series in FSeriesList do
-    for Point in Series.Data do
+    // Indexed rather than for-in: an error bar is looked up by point index,
+    // and it has to widen the range so an arm is never clipped by the plot edge.
+    for PIdx := 0 to Series.Data.Count - 1 do
     begin
+      Point := Series.Data[PIdx];
       // NaN coordinates are pen-lifts (see TPlotSeries.Draw), not data.
       // They must be ignored here or a single NaN would poison the whole
       // autoscale range (min/max comparisons against NaN are ill-defined).
@@ -2601,6 +2717,28 @@ begin
         if Point.X > MaxX then MaxX := Point.X;
         if Point.Y < MinY then MinY := Point.Y;
         if Point.Y > MaxY then MaxY := Point.Y;
+      end;
+
+      // Extend the range over the error bar, but only when it is actually
+      // drawn and only in the direction(s) drawn — an invisible bar, or the
+      // arm of a one-sided bar that isn't rendered, must not move the axes.
+      if Series.ErrorBarsVisible and Series.TryGetYError(PIdx, EMinus, EPlus) then
+      begin
+        if Series.ErrorBarDirection in [ebdBoth, ebdUp] then
+        begin
+          YArm := Point.Y + Abs(EPlus);
+          if YArm > MaxY then MaxY := YArm;
+        end;
+
+        if Series.ErrorBarDirection in [ebdBoth, ebdDown] then
+        begin
+          YArm := Point.Y - Abs(EMinus);
+          // On a log axis a non-positive arm has no representation and is
+          // pinned to the plot floor when drawn, so it must not drag the
+          // range down here either.
+          if ((not AxisStyle.LogY) or (YArm > 0)) and (YArm < MinY) then
+            MinY := YArm;
+        end;
       end;
     end;
 
@@ -2884,6 +3022,23 @@ begin
   end;
 end;
 
+function TSkPlotPaintBox.FindLegendItem(APixelX, APixelY: Single;
+                                       out ASeries: TPlotSeries): Boolean;
+var
+  I: Integer;
+  P: TPointF;
+begin
+  Result  := False;
+  ASeries := nil;
+  P := TPointF.Create(APixelX, APixelY);
+  for I := 0 to High(FLegendItemRects) do
+    if FLegendItemRects[I].Contains(P) then
+    begin
+      ASeries := FLegendItemSeries[I];
+      Exit(True);
+    end;
+end;
+
 procedure TSkPlotPaintBox.MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Single);
 var
      Item1, Item2, Item3 : TMenuItem;
@@ -2893,11 +3048,17 @@ var
 begin
   inherited MouseDown(Button, Shift, X, Y);
 
+  FCtrlPressed := ssCtrl in Shift;
+
   if (Button = TMouseButton.mbLeft) and
      FLegendStyle.Visible and
      FLegendRect.Contains(TPointF.Create(X, Y)) then
   begin
+    // A press on the legend is a drag *candidate*; MouseMove promotes it to a
+    // real drag once it crosses the threshold, and MouseUp treats anything
+    // short of that as a click on the entry under the cursor.
     FDraggingLegend    := True;
+    FLegendDragMoved   := False;
     FLegendDragStart   := TPointF.Create(X, Y);
     FLegendOffsetStart := FLegendOffset;
     // Capture the mouse so we keep receiving events even if the cursor
@@ -2967,6 +3128,7 @@ var
   PickIndex  : Integer;
   PickX, PickY : Double;
   MinPxX, MaxPxX, MinPxY, MaxPxY : Single;
+  ToggleSeries : TPlotSeries;
 begin
   inherited MouseUp(Button, Shift, X, Y);
 
@@ -2974,6 +3136,18 @@ begin
   begin
     FDraggingLegend := False;
     ReleaseCapture;
+
+    // A press that never became a drag is a click: toggle the series whose
+    // legend row it landed on. The row stays listed (dimmed) once hidden, so
+    // the same click switches it back on.
+    if (not FLegendDragMoved) and (Button = TMouseButton.mbLeft) and
+       FLegendStyle.ClickToToggle then
+      if FindLegendItem(X, Y, ToggleSeries) then
+      begin
+        ToggleSeries.Visible := not ToggleSeries.Visible;
+        Redraw;
+        Exit;
+      end;
   end;
 
   if FBoxZooming and (Button = TMouseButton.mbLeft) then
@@ -3069,9 +3243,21 @@ begin
   // Handle active drag
   if FDraggingLegend then
   begin
-    FLegendOffset.X := FLegendOffsetStart.X + (X - FLegendDragStart.X);
-    FLegendOffset.Y := FLegendOffsetStart.Y + (Y - FLegendDragStart.Y);
-    Redraw;
+    DX := X - FLegendDragStart.X;
+    DY := Y - FLegendDragStart.Y;
+
+    // Below the threshold the press is still a click candidate, so leave the
+    // legend where it is rather than nudging it by a pixel or two.
+    if (not FLegendDragMoved) and
+       ((Abs(DX) > PanThreshold) or (Abs(DY) > PanThreshold)) then
+      FLegendDragMoved := True;
+
+    if FLegendDragMoved then
+    begin
+      FLegendOffset.X := FLegendOffsetStart.X + DX;
+      FLegendOffset.Y := FLegendOffsetStart.Y + DY;
+      Redraw;
+    end;
     Exit;  // suppress coordinate reporting while dragging
   end;
 
@@ -3099,12 +3285,30 @@ begin
 end;
 
 procedure TSkPlotPaintBox.DblClick;
+var CtrlPressed: Boolean;
+    WasCtrlPressed: Boolean;
 begin
   inherited DblClick;
-  // A double-click is the quick way back to the full autoscaled view.
-  if FZoomPanEnabled then
-    ResetZoom;
+
+  WasCtrlPressed := FCtrlPressed;
+  FCtrlPressed := False;
+
+    // 1. If Ctrl was held down during the click action, reset the zoom and exit
+  if WasCtrlPressed then
+  begin
+    if FZoomPanEnabled then
+      ResetZoom;
+    Exit;
+  end;
+
+  if not Assigned (frmPlotEditor) then
+     frmPlotEditor := TfrmPlotEditor.Create (nil);
+
+  frmPlotEditor.CopyPropertiesToEditor (Self);
+  frmPlotEditor.Show;
+  Self.Redraw;
 end;
+
 
 procedure TSkPlotPaintBox.ZoomAboutPixel(ACx, ACy, AFactor: Single);
 var

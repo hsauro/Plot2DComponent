@@ -26,7 +26,7 @@ uses
   uLabelledTrackbar,
   FMX.Layouts,
   FMX.Menus,
-  FMX.Memo.Types, FMX.ScrollBox, FMX.Memo;
+  FMX.Memo.Types, FMX.ScrollBox, FMX.Memo, uPlotAnnotation;
 
 type
   TfrmMain = class(TForm)
