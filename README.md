@@ -9,6 +9,8 @@ PNG/PDF/CSV export.
 It ships as a run-time package, a design-time package (component palette
 registration) and a demo application.
 
+This code was developed using a combination of Human effort and AI assistance.
+
 ---
 
 ## Contents
